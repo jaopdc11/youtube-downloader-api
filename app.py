@@ -5,8 +5,9 @@ from pydantic import BaseModel, HttpUrl
 from typing import Optional
 import subprocess
 import os
-import random
 import re
+import requests
+import tempfile
 
 app = FastAPI()
 
@@ -36,26 +37,45 @@ def extract_video_id(url):
             return match.group(1)
     return None
 
-def update_yt_dlp():
-    """Atualiza o yt-dlp no startup"""
+def download_via_external_service(video_id: str, download_type: str, filename: str) -> bool:
+    """Tenta baixar via serviço externo quando yt-dlp falha"""
     try:
-        subprocess.run(
-            ["pip", "install", "--upgrade", "yt-dlp"], 
-            check=True, 
-            capture_output=True,
-            timeout=60
-        )
-        print("yt-dlp updated successfully")
+        # Serviços externos como fallback
+        if download_type == "audio":
+            # Tenta API pública para áudio
+            api_urls = [
+                f"https://youtube-audio-downloader.vercel.app/api/audio?url=https://youtube.com/watch?v={video_id}",
+                f"https://yt-api.cyclic.app/audio?url=https://youtube.com/watch?v={video_id}",
+            ]
+        else:
+            # Tenta API pública para vídeo
+            api_urls = [
+                f"https://yt-api.cyclic.app/video?url=https://youtube.com/watch?v={video_id}",
+            ]
+        
+        for api_url in api_urls:
+            try:
+                print(f"Trying external API: {api_url}")
+                response = requests.get(api_url, stream=True, timeout=30)
+                
+                if response.status_code == 200:
+                    with open(filename, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    # Verifica se o arquivo tem tamanho razoável
+                    if os.path.exists(filename) and os.path.getsize(filename) > 1024:
+                        print(f"Success with external API: {api_url}")
+                        return True
+            except Exception as e:
+                print(f"External API failed: {e}")
+                continue
+        
+        return False
     except Exception as e:
-        print(f"Update warning: {e}")
-
-@app.on_event("startup")
-async def startup_event():
-    update_yt_dlp()
-
-@app.get("/ping")
-async def ping():
-    return {"message": "pong"}
+        print(f"All external services failed: {e}")
+        return False
 
 @app.post("/download")
 async def download(request: DownloadRequest):
@@ -68,83 +88,58 @@ async def download(request: DownloadRequest):
 
     ext = "mp4" if download_type == "video" else "mp3"
     filename = f"{final_name}.{ext}"
+    video_id = extract_video_id(url)
 
     # Clean up old file
     if os.path.exists(filename):
         os.remove(filename)
 
-    # Estratégias em ordem de tentativa
-    strategies = [
-        # Estratégia 1: SIMPLES - igual seu script CLI
-        {
-            "name": "Simple CLI method",
-            "video_cmd": ['yt-dlp', '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4', '-o', filename, url],
-            "audio_cmd": ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, url]
-        },
-        # Estratégia 2: AGGRESSIVA - anti-bloqueio
-        {
-            "name": "Anti-block method", 
-            "video_cmd": [
-                'yt-dlp', 
-                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                '--referer', 'https://www.youtube.com/',
-                '--force-ipv4',
-                '--no-check-certificate',
-                '--throttled-rate', '100K',
-                '--sleep-requests', '2',
-                '--geo-bypass',
-                '-f', 'best[height<=720]',
-                '-o', filename, 
-                url
-            ],
-            "audio_cmd": [
-                'yt-dlp',
-                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                '--referer', 'https://www.youtube.com/',
-                '--force-ipv4', 
-                '--no-check-certificate',
-                '--throttled-rate', '100K',
-                '--sleep-requests', '2',
-                '--geo-bypass',
-                '-x', '--audio-format', 'mp3',
-                '-o', filename,
-                url
-            ]
-        },
-        # Estratégia 3: URL ALTERNATIVA - youtu.be
-        {
-            "name": "Alternative URL method",
-            "video_cmd": ['yt-dlp', '-f', 'best[height<=480]', '-o', filename, f'https://youtu.be/{extract_video_id(url)}'],
-            "audio_cmd": ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, f'https://youtu.be/{extract_video_id(url)}']
-        }
-    ]
-
-    last_error = None
-
-    for i, strategy in enumerate(strategies):
-        try:
-            print(f"Trying strategy {i+1}: {strategy['name']}")
+    # PRIMEIRA TENTATIVA: yt-dlp simples (seu método original)
+    try:
+        print("Trying direct yt-dlp method...")
+        if download_type == "video":
+            cmd = ['yt-dlp', '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4', '-o', filename, url]
+        else:
+            cmd = ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, url]
+        
+        result = subprocess.run(
+            cmd, 
+            check=True, 
+            capture_output=True, 
+            text=True,
+            timeout=120
+        )
+        
+        if os.path.exists(filename) and os.path.getsize(filename) > 1024:
+            print("Success with direct yt-dlp method!")
             
-            if download_type == "video":
-                cmd = strategy["video_cmd"]
-            else:
-                cmd = strategy["audio_cmd"]
-            
-            # Remove None values if any
-            cmd = [arg for arg in cmd if arg is not None]
-            
-            result = subprocess.run(
-                cmd, 
-                check=True, 
-                capture_output=True, 
-                text=True,
-                timeout=120
+            response = FileResponse(
+                path=filename,
+                filename=filename,
+                media_type="audio/mpeg" if download_type == "audio" else "video/mp4"
             )
+
+            @response.call_on_close
+            def cleanup():
+                if os.path.exists(filename):
+                    try:
+                        os.remove(filename)
+                    except:
+                        pass
+
+            return response
+        else:
+            raise Exception("File too small or missing")
             
-            # Check if file was created and has reasonable size
-            if os.path.exists(filename) and os.path.getsize(filename) > 1024:
-                print(f"Success with strategy {i+1}")
-                
+    except Exception as e:
+        print(f"Direct yt-dlp failed: {e}")
+        
+        # SEGUNDA TENTATIVA: Serviço externo
+        if video_id:
+            print("Trying external service...")
+            success = download_via_external_service(video_id, download_type, filename)
+            
+            if success:
                 response = FileResponse(
                     path=filename,
                     filename=filename,
@@ -160,27 +155,21 @@ async def download(request: DownloadRequest):
                             pass
 
                 return response
-            else:
-                raise Exception("Downloaded file is too small or missing")
-                
-        except Exception as e:
-            last_error = e
-            print(f"Strategy {i+1} failed: {e}")
-            
-            # Clean up failed file
-            if os.path.exists(filename):
-                try:
-                    os.remove(filename)
-                except:
-                    pass
-            
-            continue
 
-    # If all strategies failed
-    error_detail = f"All download methods failed. Last error: {str(last_error)}"
-    
-    # Provide helpful error message
-    if "Sign in to confirm you're not a bot" in str(last_error):
-        error_detail += "\n\nSOLUTION: YouTube is blocking our server IP. Please try again later.\n" \
-    
-    raise HTTPException(status_code=500, detail=error_detail)
+        # SE TUDO FALHAR
+        error_msg = (
+            "Failed to download the requested media. Please check the URL and try again later."
+        )
+        
+        raise HTTPException(status_code=503, detail=error_msg)
+
+@app.get("/ping")
+async def ping():
+    return {"message": "pong"}
+
+@app.get("/")
+async def root():
+    return {
+        "message": "YouTube Downloader API", 
+        "status": "active"
+    }
