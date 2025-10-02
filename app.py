@@ -1,9 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
 from typing import Optional
-from services.downloader import download_audio, download_video
 import subprocess
+import os
 
 app = FastAPI()
 
@@ -17,42 +18,56 @@ app.add_middleware(
 
 class DownloadRequest(BaseModel):
     url: HttpUrl
-    downloadType: str
+    downloadType: str  # "audio" ou "video"
     finalName: Optional[str] = None
+
+def run_yt_dlp(command):
+    try:
+        subprocess.run(command, check=True)
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
 
 @app.get("/ping")
 async def ping():
     return {"message": "pong"}
 
-from fastapi.responses import FileResponse
-import os
-
 @app.post("/download")
 async def download(request: DownloadRequest):
-    url = str(request.url)  # converte para string
+    url = str(request.url)
     download_type = request.downloadType.lower()
-    final_name = request.finalName.strip() if request.finalName else None
+    final_name = request.finalName.strip() if request.finalName else "download"
 
     if download_type not in ("audio", "video"):
         raise HTTPException(status_code=400, detail="downloadType must be 'audio' or 'video'")
 
-    if final_name == "":
-        final_name = None
-
     ext = "mp3" if download_type == "audio" else "mp4"
-    filename = f"{final_name}.{ext}" if final_name else f"download.{ext}"
+    filename = f"{final_name}.{ext}"
 
-    try:
-        if download_type == "video":
-            download_video(url, title=final_name, ext=ext)
-        else:
-            download_audio(url, title=final_name, ext=ext)
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
+    # Garante que não exista um resto antigo
+    if os.path.exists(filename):
+        os.remove(filename)
+
+    # Comando yt-dlp
+    if download_type == "video":
+        run_yt_dlp([
+            "yt-dlp",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
+            "-o", filename,
+            url
+        ])
+    else:
+        run_yt_dlp([
+            "yt-dlp",
+            "-x",
+            "--audio-format", ext,
+            "-o", filename,
+            url
+        ])
 
     if not os.path.exists(filename):
         raise HTTPException(status_code=500, detail="File not found after download")
 
+    # Envia o arquivo e remove depois
     response = FileResponse(
         path=filename,
         filename=filename,
