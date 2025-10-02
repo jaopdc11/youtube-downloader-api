@@ -5,6 +5,8 @@ from pydantic import BaseModel, HttpUrl
 from typing import Optional
 import subprocess
 import os
+import random
+import re
 
 app = FastAPI()
 
@@ -21,15 +23,26 @@ class DownloadRequest(BaseModel):
     downloadType: str
     finalName: Optional[str] = None
 
+def extract_video_id(url):
+    """Extrai o ID do vídeo do YouTube"""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&?\n]+)',
+        r'youtube\.com/embed/([^&?\n]+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
 def update_yt_dlp():
     """Atualiza o yt-dlp no startup"""
     try:
-        print("Updating yt-dlp...")
-        result = subprocess.run(
+        subprocess.run(
             ["pip", "install", "--upgrade", "yt-dlp"], 
             check=True, 
-            capture_output=True, 
-            text=True,
+            capture_output=True,
             timeout=60
         )
         print("yt-dlp updated successfully")
@@ -48,75 +61,126 @@ async def ping():
 async def download(request: DownloadRequest):
     url = str(request.url)
     download_type = request.downloadType.lower()
-    final_name = request.finalName.strip() if request.finalName else None
+    final_name = request.finalName.strip() if request.finalName else "download"
 
     if download_type not in ("audio", "video"):
         raise HTTPException(status_code=400, detail="downloadType must be 'audio' or 'video'")
 
-    # EXTAMENTE a mesma lógica do seu script CLI
     ext = "mp4" if download_type == "video" else "mp3"
-    filename = f"{final_name}.{ext}" if final_name else None
+    filename = f"{final_name}.{ext}"
 
-    try:
-        if download_type == "video":
-            if filename:
-                # Comando IDÊNTICO ao seu script
-                subprocess.run([
-                    'yt-dlp', 
-                    '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4', 
-                    '-o', filename, 
-                    url
-                ], check=True, capture_output=True, timeout=120)
-            else:
-                subprocess.run([
-                    'yt-dlp', 
-                    '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4', 
-                    url
-                ], check=True, capture_output=True, timeout=120)
-        else:  # audio
-            if filename:
-                # Comando IDÊNTICO ao seu script  
-                subprocess.run([
-                    'yt-dlp', 
-                    '-x', 
-                    '--audio-format', ext, 
-                    '-o', filename, 
-                    url
-                ], check=True, capture_output=True, timeout=120)
-            else:
-                subprocess.run([
-                    'yt-dlp', 
-                    '-x', 
-                    '--audio-format', ext, 
-                    url
-                ], check=True, capture_output=True, timeout=120)
+    # Clean up old file
+    if os.path.exists(filename):
+        os.remove(filename)
 
-        # Se filename foi especificado, retorna o arquivo
-        if filename and os.path.exists(filename):
-            response = FileResponse(
-                path=filename,
-                filename=filename,
-                media_type="audio/mpeg" if download_type == "audio" else "video/mp4"
+    # Estratégias em ordem de tentativa
+    strategies = [
+        # Estratégia 1: SIMPLES - igual seu script CLI
+        {
+            "name": "Simple CLI method",
+            "video_cmd": ['yt-dlp', '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4', '-o', filename, url],
+            "audio_cmd": ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, url]
+        },
+        # Estratégia 2: AGGRESSIVA - anti-bloqueio
+        {
+            "name": "Anti-block method", 
+            "video_cmd": [
+                'yt-dlp', 
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                '--referer', 'https://www.youtube.com/',
+                '--force-ipv4',
+                '--no-check-certificate',
+                '--throttled-rate', '100K',
+                '--sleep-requests', '2',
+                '--geo-bypass',
+                '-f', 'best[height<=720]',
+                '-o', filename, 
+                url
+            ],
+            "audio_cmd": [
+                'yt-dlp',
+                '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                '--referer', 'https://www.youtube.com/',
+                '--force-ipv4', 
+                '--no-check-certificate',
+                '--throttled-rate', '100K',
+                '--sleep-requests', '2',
+                '--geo-bypass',
+                '-x', '--audio-format', 'mp3',
+                '-o', filename,
+                url
+            ]
+        },
+        # Estratégia 3: URL ALTERNATIVA - youtu.be
+        {
+            "name": "Alternative URL method",
+            "video_cmd": ['yt-dlp', '-f', 'best[height<=480]', '-o', filename, f'https://youtu.be/{extract_video_id(url)}'],
+            "audio_cmd": ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, f'https://youtu.be/{extract_video_id(url)}']
+        }
+    ]
+
+    last_error = None
+
+    for i, strategy in enumerate(strategies):
+        try:
+            print(f"Trying strategy {i+1}: {strategy['name']}")
+            
+            if download_type == "video":
+                cmd = strategy["video_cmd"]
+            else:
+                cmd = strategy["audio_cmd"]
+            
+            # Remove None values if any
+            cmd = [arg for arg in cmd if arg is not None]
+            
+            result = subprocess.run(
+                cmd, 
+                check=True, 
+                capture_output=True, 
+                text=True,
+                timeout=120
             )
+            
+            # Check if file was created and has reasonable size
+            if os.path.exists(filename) and os.path.getsize(filename) > 1024:
+                print(f"Success with strategy {i+1}")
+                
+                response = FileResponse(
+                    path=filename,
+                    filename=filename,
+                    media_type="audio/mpeg" if download_type == "audio" else "video/mp4"
+                )
 
-            @response.call_on_close
-            def cleanup():
-                if os.path.exists(filename):
-                    try:
-                        os.remove(filename)
-                    except:
-                        pass
+                @response.call_on_close
+                def cleanup():
+                    if os.path.exists(filename):
+                        try:
+                            os.remove(filename)
+                        except:
+                            pass
 
-            return response
-        else:
-            # Se não tinha filename, só confirma o download
-            return {"message": "Download completed successfully"}
+                return response
+            else:
+                raise Exception("Downloaded file is too small or missing")
+                
+        except Exception as e:
+            last_error = e
+            print(f"Strategy {i+1} failed: {e}")
+            
+            # Clean up failed file
+            if os.path.exists(filename):
+                try:
+                    os.remove(filename)
+                except:
+                    pass
+            
+            continue
 
-    except subprocess.CalledProcessError as e:
-        error_msg = f"Download failed: {e.stderr.decode() if e.stderr else str(e)}"
-        print(f"Error: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
-    except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        print(f"Error: {error_msg}")
-        raise HTTPException(status_code=500, detail=error_msg)
+    # If all strategies failed
+    error_detail = f"All download methods failed. Last error: {str(last_error)}"
+    
+    # Provide helpful error message
+    if "Sign in to confirm you're not a bot" in str(last_error):
+        error_detail += "\n\nSOLUTION: YouTube is blocking our server IP. Please try again later.\n" \
+    
+    raise HTTPException(status_code=500, detail=error_detail)
