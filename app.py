@@ -144,6 +144,7 @@ async def download_turbo(request: DownloadRequest, background_tasks: BackgroundT
             logger.warning(f"⏰ TIMEOUT: {download_time:.2f}s")
             
             if 'filename' in locals():
+                
                 background_tasks.add_task(cleanup_file, filename)
             
             raise HTTPException(
