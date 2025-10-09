@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
@@ -6,10 +6,15 @@ from typing import Optional
 import subprocess
 import os
 import re
-import requests
-import tempfile
+import logging
+import asyncio
+import uuid
 
-app = FastAPI()
+# Configuração mínima
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="YouTube Downloader")
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,157 +24,166 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MAX_CONCURRENT_DOWNLOADS = 1
+DOWNLOAD_TIMEOUT = 25  # Aumentei um pouco para qualidade melhor
+
+download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+
 class DownloadRequest(BaseModel):
     url: HttpUrl
     downloadType: str
     finalName: Optional[str] = None
 
-def extract_video_id(url):
-    """Extrai o ID do vídeo do YouTube"""
-    patterns = [
-        r'(?:youtube\.com/watch\?v=|youtu\.be/)([^&?\n]+)',
-        r'youtube\.com/embed/([^&?\n]+)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
-
-def download_via_external_service(video_id: str, download_type: str, filename: str) -> bool:
-    """Tenta baixar via serviço externo quando yt-dlp falha"""
+def cleanup_file(filepath: str):
     try:
-        # Serviços externos como fallback
-        if download_type == "audio":
-            # Tenta API pública para áudio
-            api_urls = [
-                f"https://youtube-audio-downloader.vercel.app/api/audio?url=https://youtube.com/watch?v={video_id}",
-                f"https://yt-api.cyclic.app/audio?url=https://youtube.com/watch?v={video_id}",
-            ]
-        else:
-            # Tenta API pública para vídeo
-            api_urls = [
-                f"https://yt-api.cyclic.app/video?url=https://youtube.com/watch?v={video_id}",
-            ]
-        
-        for api_url in api_urls:
-            try:
-                print(f"Trying external API: {api_url}")
-                response = requests.get(api_url, stream=True, timeout=30)
-                
-                if response.status_code == 200:
-                    with open(filename, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            if chunk:
-                                f.write(chunk)
-                    
-                    # Verifica se o arquivo tem tamanho razoável
-                    if os.path.exists(filename) and os.path.getsize(filename) > 1024:
-                        print(f"Success with external API: {api_url}")
-                        return True
-            except Exception as e:
-                print(f"External API failed: {e}")
-                continue
-        
-        return False
-    except Exception as e:
-        print(f"All external services failed: {e}")
-        return False
+        if os.path.exists(filepath):
+            os.remove(filepath)
+    except:
+        pass
 
 @app.post("/download")
-async def download(request: DownloadRequest):
-    url = str(request.url)
-    download_type = request.downloadType.lower()
-    final_name = request.finalName.strip() if request.finalName else "download"
-
-    if download_type not in ("audio", "video"):
-        raise HTTPException(status_code=400, detail="downloadType must be 'audio' or 'video'")
-
-    ext = "mp4" if download_type == "video" else "mp3"
-    filename = f"{final_name}.{ext}"
-    video_id = extract_video_id(url)
-
-    # Clean up old file
-    if os.path.exists(filename):
-        os.remove(filename)
-
-    # PRIMEIRA TENTATIVA: yt-dlp simples (seu método original)
-    try:
-        print("Trying direct yt-dlp method...")
-        if download_type == "video":
-            cmd = ['yt-dlp', '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4', '-o', filename, url]
-        else:
-            cmd = ['yt-dlp', '-x', '--audio-format', 'mp3', '-o', filename, url]
+async def download_turbo(request: DownloadRequest, background_tasks: BackgroundTasks):
+    async with download_semaphore:
+        start_time = asyncio.get_event_loop().time()
         
-        result = subprocess.run(
-            cmd, 
-            check=True, 
-            capture_output=True, 
-            text=True,
-            timeout=120
-        )
-        
-        if os.path.exists(filename) and os.path.getsize(filename) > 1024:
-            print("Success with direct yt-dlp method!")
+        try:
+            url = str(request.url)
+            download_type = request.downloadType.lower()
             
-            response = FileResponse(
-                path=filename,
-                filename=filename,
-                media_type="audio/mpeg" if download_type == "audio" else "video/mp4"
+            if download_type not in ("audio", "video"):
+                raise HTTPException(status_code=400, detail="Tipo deve ser 'audio' ou 'video'")
+
+            # Nome do arquivo simples e único
+            file_id = uuid.uuid4().hex[:8]
+            final_name = request.finalName.strip()[:20] if request.finalName else f"dl_{file_id}"
+            final_name = re.sub(r'[^\w\-_]', '', final_name)
+            
+            ext = "mp4" if download_type == "video" else "mp3"
+            filename = f"turbo_{file_id}.{ext}"
+            
+            # Limpeza rápida se existir
+            if os.path.exists(filename):
+                cleanup_file(filename)
+
+            # CONFIGURAÇÃO BALANCEADA - qualidade média + velocidade
+            balanced_options = [
+                '--no-mtime',
+                '--no-cache-dir', 
+                '--no-playlist',
+                '--socket-timeout', '10',
+                '--source-address', '0.0.0.0',
+                '--force-ipv4',
+                '--throttled-rate', '2M',
+                '--retries', '2',
+                '--fragment-retries', '2',
+                '--skip-unavailable-fragments',
+                '--no-part',
+            ]
+
+            # COMANDO COM QUALIDADE MÉDIA
+            if download_type == "audio":
+                cmd = [
+                    'yt-dlp',
+                    *balanced_options,
+                    '-x', 
+                    '--audio-format', 'mp3',
+                    '--audio-quality', '192K',  # QUALIDADE MÉDIA - 192kbps
+                    '-o', filename,
+                    url
+                ]
+            else:
+                cmd = [
+                    'yt-dlp',
+                    *balanced_options,
+                    '-f', 'best[height<=720]/best[height<=480]/best[ext=mp4]',  # Até 720p, fallback para 480p
+                    '--merge-output-format', 'mp4',
+                    '-o', filename, 
+                    url
+                ]
+
+            # EXECUÇÃO
+            loop = asyncio.get_event_loop()
+            
+            def execute_download():
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True, 
+                        timeout=DOWNLOAD_TIMEOUT,
+                        check=True
+                    )
+                    return os.path.exists(filename) and os.path.getsize(filename) > 10240
+                except:
+                    return False
+
+            # DOWNLOAD ASSÍNCRONO
+            success = await asyncio.wait_for(
+                loop.run_in_executor(None, execute_download),
+                timeout=DOWNLOAD_TIMEOUT - 2
             )
 
-            @response.call_on_close
-            def cleanup():
-                if os.path.exists(filename):
-                    try:
-                        os.remove(filename)
-                    except:
-                        pass
+            download_time = asyncio.get_event_loop().time() - start_time
 
-            return response
-        else:
-            raise Exception("File too small or missing")
-            
-    except Exception as e:
-        print(f"Direct yt-dlp failed: {e}")
-        
-        # SEGUNDA TENTATIVA: Serviço externo
-        if video_id:
-            print("Trying external service...")
-            success = download_via_external_service(video_id, download_type, filename)
-            
             if success:
-                response = FileResponse(
+                file_size = os.path.getsize(filename)
+                logger.warning(f"✅ SUCESSO: {download_time:.2f}s, {file_size} bytes")
+                
+                background_tasks.add_task(cleanup_file, filename)
+                
+                return FileResponse(
                     path=filename,
-                    filename=filename,
+                    filename=f"{final_name}.{ext}",
                     media_type="audio/mpeg" if download_type == "audio" else "video/mp4"
                 )
+            else:
+                raise Exception(f"Falha no download")
 
-                @response.call_on_close
-                def cleanup():
-                    if os.path.exists(filename):
-                        try:
-                            os.remove(filename)
-                        except:
-                            pass
+        except asyncio.TimeoutError:
+            download_time = asyncio.get_event_loop().time() - start_time
+            logger.warning(f"⏰ TIMEOUT: {download_time:.2f}s")
+            
+            if 'filename' in locals():
+                background_tasks.add_task(cleanup_file, filename)
+            
+            raise HTTPException(
+                status_code=408,
+                detail=f"Timeout: não baixou em {download_time:.1f}s (limite: {DOWNLOAD_TIMEOUT}s)"
+            )
+        except Exception as e:
+            download_time = asyncio.get_event_loop().time() - start_time
+            logger.warning(f"❌ ERRO: {download_time:.2f}s - {str(e)}")
+            
+            if 'filename' in locals():
+                background_tasks.add_task(cleanup_file, filename)
+            
+            raise HTTPException(
+                status_code=503,
+                detail=f"Erro no download: {str(e)}"
+            )
 
-                return response
-
-        # SE TUDO FALHAR
-        error_msg = (
-            "Failed to download the requested media. Please check the URL and try again later."
-        )
-        
-        raise HTTPException(status_code=503, detail=error_msg)
-
-@app.get("/ping")
-async def ping():
-    return {"message": "pong"}
+@app.get("/status")
+async def status():
+    return {
+        "status": "ativo",
+        "qualidade": "media",
+        "performance": {
+            "timeout_maximo_segundos": DOWNLOAD_TIMEOUT,
+            "downloads_simultaneos": MAX_CONCURRENT_DOWNLOADS,
+            "audio_qualidade": "192kbps",
+            "video_qualidade": "até 720p"
+        }
+    }
 
 @app.get("/")
 async def root():
-    return {
-        "message": "YouTube Downloader API", 
-        "status": "active"
-    }
+    return {"message": "🎵 YouTube Downloader - Qualidade Média"}
+
+# Health check simples
+@app.get("/health")
+async def health_check():
+    try:
+        result = subprocess.run(['yt-dlp', '--version'], capture_output=True, timeout=3)
+        return {"status": "ready", "yt_dlp": result.returncode == 0}
+    except:
+        return {"status": "degraded", "yt_dlp": False}
