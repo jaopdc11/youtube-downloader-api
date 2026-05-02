@@ -25,7 +25,7 @@ app.add_middleware(
 )
 
 MAX_CONCURRENT_DOWNLOADS = 1
-DOWNLOAD_TIMEOUT = 25  # Aumentei um pouco para qualidade melhor
+DOWNLOAD_TIMEOUT = 60
 
 download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
@@ -60,44 +60,44 @@ async def download_turbo(request: DownloadRequest, background_tasks: BackgroundT
             
             ext = "mp4" if download_type == "video" else "mp3"
             filename = f"turbo_{file_id}.{ext}"
-            
+            output_template = f"turbo_{file_id}.%(ext)s"
+
             # Limpeza rápida se existir
             if os.path.exists(filename):
                 cleanup_file(filename)
 
-            # CONFIGURAÇÃO BALANCEADA - qualidade média + velocidade
             balanced_options = [
                 '--no-mtime',
-                '--no-cache-dir', 
+                '--no-cache-dir',
                 '--no-playlist',
-                '--socket-timeout', '10',
-                '--source-address', '0.0.0.0',
+                '--no-warnings',
+                '--socket-timeout', '15',
                 '--force-ipv4',
-                '--throttled-rate', '2M',
-                '--retries', '2',
-                '--fragment-retries', '2',
+                '--retries', '3',
+                '--fragment-retries', '3',
                 '--skip-unavailable-fragments',
-                '--no-part',
+                # YouTube bloqueia o player web (SABR / 403). Forçamos clientes
+                # que ainda servem URLs diretas.
+                '--extractor-args', 'youtube:player_client=android_vr,tv,web_safari',
             ]
 
-            # COMANDO COM QUALIDADE MÉDIA
             if download_type == "audio":
                 cmd = [
                     'yt-dlp',
                     *balanced_options,
-                    '-x', 
+                    '-x',
                     '--audio-format', 'mp3',
-                    '--audio-quality', '192K',  # QUALIDADE MÉDIA - 192kbps
-                    '-o', filename,
+                    '--audio-quality', '192K',
+                    '-o', output_template,
                     url
                 ]
             else:
                 cmd = [
                     'yt-dlp',
                     *balanced_options,
-                    '-f', 'best[height<=720]/best[height<=480]/best[ext=mp4]',  # Até 720p, fallback para 480p
+                    '-f', 'bv*[height<=720]+ba/b[height<=720]/bv*+ba/b',
                     '--merge-output-format', 'mp4',
-                    '-o', filename, 
+                    '-o', output_template,
                     url
                 ]
 
@@ -109,12 +109,25 @@ async def download_turbo(request: DownloadRequest, background_tasks: BackgroundT
                     result = subprocess.run(
                         cmd,
                         capture_output=True,
-                        text=True, 
+                        text=True,
                         timeout=DOWNLOAD_TIMEOUT,
                         check=True
                     )
-                    return os.path.exists(filename) and os.path.getsize(filename) > 10240
-                except:
+                    if not os.path.exists(filename):
+                        logger.warning(f"arquivo esperado nao existe: {filename} | stdout={result.stdout[-500:]} stderr={result.stderr[-500:]}")
+                        return False
+                    if os.path.getsize(filename) <= 10240:
+                        logger.warning(f"arquivo muito pequeno: {filename} ({os.path.getsize(filename)} bytes)")
+                        return False
+                    return True
+                except subprocess.CalledProcessError as e:
+                    logger.warning(f"yt-dlp falhou rc={e.returncode} stderr={(e.stderr or '')[-500:]}")
+                    return False
+                except subprocess.TimeoutExpired:
+                    logger.warning("yt-dlp timeout no subprocess")
+                    return False
+                except Exception as e:
+                    logger.warning(f"erro inesperado: {type(e).__name__}: {e}")
                     return False
 
             # DOWNLOAD ASSÍNCRONO
